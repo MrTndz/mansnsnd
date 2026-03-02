@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Business Message Monitor Bot
-Version: 5.0.0
-Author: Business Monitor Team
-Date: 2026-03-01
+Telegram Chat Monitor Bot
+Version: 6.0.0
+Author: Merzost?
+Date: 2026-03-02
 
-Улучшенная версия с расширенным управлением пользователями,
-сохранением медиа с таймерами и 20+ новыми функциями
+Профессиональный мониторинг чатов с интеграцией Telegram Stars,
+реферальной системой и расширенными настройками
 """
 
 import asyncio
@@ -22,6 +22,8 @@ from pathlib import Path
 import aiofiles
 import hashlib
 import base64
+import zipfile
+import io
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -42,7 +44,10 @@ from aiogram.types import (
     BufferedInputFile,
     PhotoSize,
     Video,
-    VideoNote
+    VideoNote,
+    LabeledPrice,
+    PreCheckoutQuery,
+    SuccessfulPayment
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -78,6 +83,16 @@ USERS_PER_PAGE = 10
 MAX_MEDIA_SIZE = 50 * 1024 * 1024  # 50MB
 MEDIA_CLEANUP_DAYS = 90
 
+# Цены подписок в Stars
+TRIAL_DAYS = 3
+WEEKLY_PRICE = 20  # Stars
+MONTHLY_PRICE = 50  # Stars
+QUARTERLY_PRICE = 120  # Stars (скидка 20%)
+YEARLY_PRICE = 400  # Stars (скидка 33%)
+
+# Реферальная система
+REFERRAL_BONUS_PERCENT = 20  # 20% от оплаты реферала
+
 # ========================================
 # FSM СОСТОЯНИЯ
 # ========================================
@@ -96,10 +111,10 @@ class AdminStates(StatesGroup):
     statistics = State()
     search_user = State()
 
-class SubscriptionStates(StatesGroup):
-    """Состояния для управления подпиской"""
-    choosing_plan = State()
-    payment_confirmation = State()
+class UserStates(StatesGroup):
+    """Состояния для пользователей"""
+    settings_notifications = State()
+    referral_stats = State()
 
 # ========================================
 # DATABASE
@@ -138,6 +153,7 @@ class Database:
                 subscription_type TEXT DEFAULT 'free',
                 subscription_expires TIMESTAMP,
                 trial_used BOOLEAN DEFAULT 0,
+                auto_trial_activated BOOLEAN DEFAULT 0,
                 total_messages_saved INTEGER DEFAULT 0,
                 total_deletions_tracked INTEGER DEFAULT 0,
                 total_edits_tracked INTEGER DEFAULT 0,
@@ -148,11 +164,21 @@ class Database:
                 total_audio INTEGER DEFAULT 0,
                 total_voice INTEGER DEFAULT 0,
                 total_video_note INTEGER DEFAULT 0,
-                stars_balance INTEGER DEFAULT 0
+                total_sticker INTEGER DEFAULT 0,
+                stars_balance INTEGER DEFAULT 0,
+                referral_code TEXT UNIQUE,
+                referred_by INTEGER,
+                referral_earnings INTEGER DEFAULT 0,
+                total_referrals INTEGER DEFAULT 0,
+                notify_deletions BOOLEAN DEFAULT 1,
+                notify_edits BOOLEAN DEFAULT 1,
+                notify_media_timers BOOLEAN DEFAULT 1,
+                notify_connections BOOLEAN DEFAULT 1,
+                FOREIGN KEY (referred_by) REFERENCES users(user_id)
             )
         ''')
         
-        # Таблица бизнес-подключений
+        # Таблица подключений
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS business_connections (
                 connection_id TEXT PRIMARY KEY,
@@ -175,6 +201,7 @@ class Database:
                 message_id INTEGER,
                 sender_id INTEGER,
                 sender_username TEXT,
+                sender_first_name TEXT,
                 message_text TEXT,
                 media_type TEXT,
                 media_file_id TEXT,
@@ -233,10 +260,10 @@ class Database:
             CREATE TABLE IF NOT EXISTS payments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
-                amount REAL,
-                currency TEXT DEFAULT 'RUB',
+                amount_stars INTEGER,
                 plan_type TEXT,
-                payment_method TEXT,
+                payment_charge_id TEXT,
+                telegram_payment_charge_id TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 confirmed_at TIMESTAMP,
@@ -276,28 +303,63 @@ class Database:
                 amount INTEGER,
                 transaction_type TEXT,
                 description TEXT,
+                related_user_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         ''')
         
+        # Таблица рефералов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referral_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER,
+                referred_id INTEGER,
+                action_type TEXT,
+                bonus_amount INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (referrer_id) REFERENCES users(user_id),
+                FOREIGN KEY (referred_id) REFERENCES users(user_id)
+            )
+        ''')
+        
         conn.commit()
         conn.close()
-        logger.info("База данных инициализирована (версия 5.0.0)")
+        logger.info("База данных инициализирована (версия 6.0.0)")
     
     # ========================================
     # МЕТОДЫ ДЛЯ РАБОТЫ С ПОЛЬЗОВАТЕЛЯМИ
     # ========================================
     
-    def add_user(self, user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+    def add_user(self, user_id: int, username: str = None, first_name: str = None, 
+                 last_name: str = None, referred_by: int = None):
         """Добавление нового пользователя"""
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
+            # Генерируем уникальный реферальный код
+            referral_code = self._generate_referral_code(user_id)
+            
             cursor.execute('''
-                INSERT OR IGNORE INTO users (user_id, username, first_name, last_name)
-                VALUES (?, ?, ?, ?)
-            ''', (user_id, username, first_name, last_name))
+                INSERT OR IGNORE INTO users 
+                (user_id, username, first_name, last_name, referral_code, referred_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, username, first_name, last_name, referral_code, referred_by))
+            
+            # Если был приглашен по реферальной ссылке
+            if referred_by and cursor.rowcount > 0:
+                cursor.execute('''
+                    UPDATE users 
+                    SET total_referrals = total_referrals + 1 
+                    WHERE user_id = ?
+                ''', (referred_by,))
+                
+                cursor.execute('''
+                    INSERT INTO referral_actions 
+                    (referrer_id, referred_id, action_type, bonus_amount)
+                    VALUES (?, ?, 'registration', 0)
+                ''', (referred_by, user_id))
+            
             conn.commit()
             return True
         except Exception as e:
@@ -306,11 +368,28 @@ class Database:
         finally:
             conn.close()
     
+    def _generate_referral_code(self, user_id: int) -> str:
+        """Генерация уникального реферального кода"""
+        import random
+        import string
+        base = f"{user_id}"
+        random_part = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        return f"REF{base}{random_part}"
+    
     def get_user(self, user_id: int) -> Optional[Dict]:
         """Получение данных пользователя"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    
+    def get_user_by_referral_code(self, code: str) -> Optional[Dict]:
+        """Получение пользователя по реферальному коду"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE referral_code = ?', (code,))
         row = cursor.fetchone()
         conn.close()
         return dict(row) if row else None
@@ -335,20 +414,23 @@ class Database:
         conn.commit()
         conn.close()
     
-    def activate_trial(self, user_id: int):
-        """Активация пробного периода"""
+    def activate_auto_trial(self, user_id: int):
+        """Автоматическая активация пробного периода при первом подключении"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        expires = datetime.now() + timedelta(days=7)
+        expires = datetime.now() + timedelta(days=TRIAL_DAYS)
         cursor.execute('''
             UPDATE users 
             SET subscription_type = 'trial', 
                 subscription_expires = ?,
-                trial_used = 1
-            WHERE user_id = ?
+                trial_used = 1,
+                auto_trial_activated = 1
+            WHERE user_id = ? AND trial_used = 0
         ''', (expires, user_id))
+        affected = cursor.rowcount
         conn.commit()
         conn.close()
+        return affected > 0
     
     def activate_subscription(self, user_id: int, plan_type: str, days: int = None):
         """Активация подписки"""
@@ -357,8 +439,12 @@ class Database:
         
         if days:
             expires = datetime.now() + timedelta(days=days)
+        elif plan_type == 'weekly':
+            expires = datetime.now() + timedelta(days=7)
         elif plan_type == 'monthly':
             expires = datetime.now() + timedelta(days=30)
+        elif plan_type == 'quarterly':
+            expires = datetime.now() + timedelta(days=90)
         elif plan_type == 'yearly':
             expires = datetime.now() + timedelta(days=365)
         elif plan_type == 'lifetime':
@@ -375,7 +461,6 @@ class Database:
         conn.commit()
         conn.close()
         
-        # Логируем действие
         self.log_admin_action(ADMIN_ID, user_id, 'subscription_activated', 
                              f'Plan: {plan_type}, Expires: {expires}')
     
@@ -437,11 +522,21 @@ class Database:
         conn.close()
         self.log_admin_action(ADMIN_ID, user_id, 'user_unblocked', 'User unblocked by admin')
     
+    def update_notification_settings(self, user_id: int, setting: str, value: bool):
+        """Обновление настроек уведомлений"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(f'''
+            UPDATE users SET {setting} = ? WHERE user_id = ?
+        ''', (value, user_id))
+        conn.commit()
+        conn.close()
+    
     # ========================================
     # МЕТОДЫ ДЛЯ РАБОТЫ С STARS
     # ========================================
     
-    def add_stars(self, user_id: int, amount: int, description: str = ""):
+    def add_stars(self, user_id: int, amount: int, description: str = "", related_user_id: int = None):
         """Добавление звезд пользователю"""
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -451,14 +546,35 @@ class Database:
         ''', (amount, user_id))
         
         cursor.execute('''
-            INSERT INTO stars_transactions (user_id, amount, transaction_type, description)
-            VALUES (?, ?, 'add', ?)
-        ''', (user_id, amount, description))
+            INSERT INTO stars_transactions 
+            (user_id, amount, transaction_type, description, related_user_id)
+            VALUES (?, ?, 'add', ?, ?)
+        ''', (user_id, amount, description, related_user_id))
         
         conn.commit()
         conn.close()
         
-        self.log_admin_action(ADMIN_ID, user_id, 'stars_added', f'Amount: {amount}, Reason: {description}')
+        if description.startswith("Admin"):
+            self.log_admin_action(ADMIN_ID, user_id, 'stars_added', 
+                                 f'Amount: {amount}, Reason: {description}')
+    
+    def spend_stars(self, user_id: int, amount: int, description: str = ""):
+        """Списание звезд"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE users SET stars_balance = stars_balance - ? WHERE user_id = ?
+        ''', (amount, user_id))
+        
+        cursor.execute('''
+            INSERT INTO stars_transactions 
+            (user_id, amount, transaction_type, description)
+            VALUES (?, ?, 'spend', ?)
+        ''', (user_id, -amount, description))
+        
+        conn.commit()
+        conn.close()
     
     def get_stars_balance(self, user_id: int) -> int:
         """Получение баланса звезд"""
@@ -469,8 +585,9 @@ class Database:
     # МЕТОДЫ ДЛЯ РАБОТЫ С ПОДКЛЮЧЕНИЯМИ
     # ========================================
     
-    def add_business_connection(self, connection_id: str, user_id: int, connected_user_id: int, can_reply: bool = False):
-        """Добавление бизнес-подключения"""
+    def add_business_connection(self, connection_id: str, user_id: int, 
+                               connected_user_id: int, can_reply: bool = False):
+        """Добавление подключения"""
         conn = self.get_connection()
         cursor = conn.cursor()
         try:
@@ -482,13 +599,13 @@ class Database:
             conn.commit()
             return True
         except Exception as e:
-            logger.error(f"Ошибка добавления бизнес-подключения: {e}")
+            logger.error(f"Ошибка добавления подключения: {e}")
             return False
         finally:
             conn.close()
     
     def get_business_connection(self, connection_id: str) -> Optional[Dict]:
-        """Получение данных бизнес-подключения"""
+        """Получение данных подключения"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM business_connections WHERE connection_id = ?', (connection_id,))
@@ -510,11 +627,11 @@ class Database:
     # ========================================
     
     def save_message(self, user_id: int, connection_id: str, chat_id: int, message_id: int,
-                    sender_id: int, sender_username: str = None, message_text: str = None,
-                    media_type: str = None, media_file_id: str = None, media_file_path: str = None,
-                    media_thumbnail_path: str = None, caption: str = None, has_timer: bool = False, 
-                    timer_seconds: int = None, is_view_once: bool = False,
-                    media_width: int = None, media_height: int = None, 
+                    sender_id: int, sender_username: str = None, sender_first_name: str = None,
+                    message_text: str = None, media_type: str = None, media_file_id: str = None, 
+                    media_file_path: str = None, media_thumbnail_path: str = None, 
+                    caption: str = None, has_timer: bool = False, timer_seconds: int = None, 
+                    is_view_once: bool = False, media_width: int = None, media_height: int = None, 
                     media_duration: int = None, media_file_size: int = None):
         """Сохранение сообщения с поддержкой таймеров"""
         conn = self.get_connection()
@@ -527,14 +644,14 @@ class Database:
             cursor.execute('''
                 INSERT INTO saved_messages 
                 (user_id, connection_id, chat_id, message_id, sender_id, sender_username,
-                 message_text, media_type, media_file_id, media_file_path, media_thumbnail_path,
-                 caption, has_timer, timer_seconds, timer_expires, is_view_once,
-                 media_width, media_height, media_duration, media_file_size)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 sender_first_name, message_text, media_type, media_file_id, media_file_path, 
+                 media_thumbnail_path, caption, has_timer, timer_seconds, timer_expires, 
+                 is_view_once, media_width, media_height, media_duration, media_file_size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (user_id, connection_id, chat_id, message_id, sender_id, sender_username,
-                  message_text, media_type, media_file_id, media_file_path, media_thumbnail_path,
-                  caption, has_timer, timer_seconds, timer_expires, is_view_once,
-                  media_width, media_height, media_duration, media_file_size))
+                  sender_first_name, message_text, media_type, media_file_id, media_file_path, 
+                  media_thumbnail_path, caption, has_timer, timer_seconds, timer_expires, 
+                  is_view_once, media_width, media_height, media_duration, media_file_size))
             conn.commit()
             
             # Обновляем статистику
@@ -549,7 +666,6 @@ class Database:
                     WHERE user_id = ?
                 ''', (user_id,))
                 
-                # Обновляем счетчик конкретного типа медиа
                 media_column = f'total_{media_type}'
                 cursor.execute(f'''
                     UPDATE users SET {media_column} = {media_column} + 1
@@ -630,6 +746,94 @@ class Database:
         rows = cursor.fetchall()
         conn.close()
         return [dict(row) for row in rows]
+    
+    # ========================================
+    # МЕТОДЫ ДЛЯ РЕФЕРАЛОВ
+    # ========================================
+    
+    def process_referral_payment(self, user_id: int, amount_stars: int):
+        """Обработка реферального бонуса при оплате"""
+        user = self.get_user(user_id)
+        if not user or not user['referred_by']:
+            return
+        
+        referrer_id = user['referred_by']
+        bonus = int(amount_stars * REFERRAL_BONUS_PERCENT / 100)
+        
+        self.add_stars(referrer_id, bonus, 
+                      f"Реферальный бонус от пользователя {user_id}", user_id)
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE users 
+            SET referral_earnings = referral_earnings + ?
+            WHERE user_id = ?
+        ''', (bonus, referrer_id))
+        
+        cursor.execute('''
+            INSERT INTO referral_actions 
+            (referrer_id, referred_id, action_type, bonus_amount)
+            VALUES (?, ?, 'payment', ?)
+        ''', (referrer_id, user_id, bonus))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_referral_stats(self, user_id: int) -> Dict:
+        """Получение статистики по рефералам"""
+        user = self.get_user(user_id)
+        if not user:
+            return {}
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Получаем список рефералов
+        cursor.execute('''
+            SELECT user_id, username, first_name, subscription_type, registered_at
+            FROM users
+            WHERE referred_by = ?
+            ORDER BY registered_at DESC
+        ''', (user_id,))
+        referrals = [dict(row) for row in cursor.fetchall()]
+        
+        # Получаем историю бонусов
+        cursor.execute('''
+            SELECT * FROM referral_actions
+            WHERE referrer_id = ?
+            ORDER BY created_at DESC
+            LIMIT 10
+        ''', (user_id,))
+        actions = [dict(row) for row in cursor.fetchall()]
+        
+        conn.close()
+        
+        return {
+            'total': user['total_referrals'],
+            'earnings': user['referral_earnings'],
+            'referrals': referrals,
+            'actions': actions,
+            'code': user['referral_code']
+        }
+    
+    # ========================================
+    # МЕТОДЫ ДЛЯ ПЛАТЕЖЕЙ
+    # ========================================
+    
+    def save_payment(self, user_id: int, amount_stars: int, plan_type: str, 
+                     payment_charge_id: str, telegram_payment_charge_id: str):
+        """Сохранение платежа"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO payments 
+            (user_id, amount_stars, plan_type, payment_charge_id, 
+             telegram_payment_charge_id, status, confirmed_at)
+            VALUES (?, ?, ?, ?, ?, 'confirmed', CURRENT_TIMESTAMP)
+        ''', (user_id, amount_stars, plan_type, payment_charge_id, telegram_payment_charge_id))
+        conn.commit()
+        conn.close()
     
     # ========================================
     # МЕТОДЫ ДЛЯ АДМИНИСТРАТОРА
@@ -777,18 +981,15 @@ async def download_media(bot: Bot, file_id: str, file_type: str, user_id: int,
         file = await bot.get_file(file_id)
         file_extension = file.file_path.split('.')[-1] if file.file_path else 'bin'
         
-        # Создаем директорию для пользователя
         user_media_dir = MEDIA_DIR / str(user_id)
         user_media_dir.mkdir(exist_ok=True)
         
-        # Генерируем уникальное имя файла
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         file_hash = hashlib.md5(file_id.encode()).hexdigest()[:8]
         timer_prefix = "timer_" if has_timer else ""
         filename = f"{timer_prefix}{file_type}_{timestamp}_{file_hash}.{file_extension}"
         file_path = user_media_dir / filename
         
-        # Скачиваем файл
         await bot.download_file(file.file_path, file_path)
         
         logger.info(f"Медиафайл сохранен: {file_path} (таймер: {has_timer})")
@@ -817,62 +1018,69 @@ async def download_thumbnail(bot: Bot, photo: PhotoSize, user_id: int) -> Option
         logger.error(f"Ошибка скачивания миниатюры: {e}")
         return None
 
-async def export_chat_to_text(user_id: int, chat_id: int, chat_title: str) -> Optional[str]:
-    """Экспорт чата в текстовый файл"""
+async def export_deleted_chat_to_archive(user_id: int, chat_id: int, 
+                                        messages: List[Dict], chat_title: str) -> Optional[str]:
+    """Экспорт удаленного чата в ZIP архив с медиа"""
     try:
-        messages = db.get_chat_messages(user_id, chat_id)
-        
-        if not messages:
-            return None
-        
         user_export_dir = EXPORTS_DIR / str(user_id)
         user_export_dir.mkdir(exist_ok=True)
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"chat_{chat_id}_{timestamp}.txt"
-        file_path = user_export_dir / filename
+        zip_filename = f"deleted_chat_{chat_id}_{timestamp}.zip"
+        zip_path = user_export_dir / zip_filename
         
-        content = f"Экспорт чата: {chat_title}\n"
-        content += f"Дата экспорта: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        content += f"Всего сообщений: {len(messages)}\n"
-        content += "=" * 80 + "\n\n"
+        # Создаем текстовый отчет
+        report = f"Удаленный чат: {chat_title}\n"
+        report += f"Дата удаления: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        report += f"Всего сообщений: {len(messages)}\n"
+        report += "=" * 80 + "\n\n"
+        
+        media_files = []
         
         for msg in messages:
             timestamp_str = msg['created_at']
-            sender = msg['sender_username'] or f"User {msg['sender_id']}"
+            sender = msg['sender_username'] or msg['sender_first_name'] or f"User {msg['sender_id']}"
             
-            content += f"[{timestamp_str}] {sender}:\n"
+            report += f"[{timestamp_str}] {sender}:\n"
             
             if msg['message_text']:
-                content += f"{msg['message_text']}\n"
+                report += f"{msg['message_text']}\n"
             
             if msg['media_type']:
-                content += f"[{msg['media_type'].upper()}]"
+                media_filename = f"media_{msg['message_id']}"
+                report += f"[{msg['media_type'].upper()}]"
                 if msg['has_timer']:
-                    content += f" [ТАЙМЕР: {msg['timer_seconds']}с]"
+                    report += f" [⏱ ТАЙМЕР: {msg['timer_seconds']}с]"
                 if msg['is_view_once']:
-                    content += " [ОДНОРАЗОВЫЙ ПРОСМОТР]"
-                content += "\n"
+                    report += " [👁 ОДНОРАЗОВЫЙ]"
+                report += f" → {media_filename}\n"
+                
                 if msg['caption']:
-                    content += f"Подпись: {msg['caption']}\n"
+                    report += f"Подпись: {msg['caption']}\n"
+                
+                # Добавляем медиафайл в список для архива
+                if msg['media_file_path'] and Path(msg['media_file_path']).exists():
+                    media_files.append((msg['media_file_path'], media_filename))
             
-            if msg['is_edited']:
-                content += f"(отредактировано: {msg['edited_at']})\n"
-                if msg['original_text']:
-                    content += f"Оригинал: {msg['original_text']}\n"
-            
-            if msg['is_deleted']:
-                content += f"(УДАЛЕНО: {msg['deleted_at']})\n"
-            
-            content += "-" * 80 + "\n\n"
+            report += "-" * 80 + "\n\n"
         
-        async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
-            await f.write(content)
+        # Создаем ZIP архив
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            # Добавляем текстовый отчет
+            zipf.writestr('chat_report.txt', report.encode('utf-8'))
+            
+            # Добавляем медиафайлы
+            for media_path, media_name in media_files:
+                try:
+                    ext = Path(media_path).suffix
+                    zipf.write(media_path, f"media/{media_name}{ext}")
+                except Exception as e:
+                    logger.error(f"Ошибка добавления медиа в архив: {e}")
         
-        logger.info(f"Чат экспортирован: {file_path}")
-        return str(file_path)
+        logger.info(f"Чат экспортирован в архив: {zip_path}")
+        return str(zip_path)
     except Exception as e:
-        logger.error(f"Ошибка экспорта чата: {e}")
+        logger.error(f"Ошибка экспорта чата в архив: {e}")
         return None
 
 def format_subscription_info(user: Dict) -> str:
@@ -890,16 +1098,26 @@ def format_subscription_info(user: Dict) -> str:
             days_left = (expires - datetime.now()).days
             return f"🎁 Пробный ({days_left}д)"
         return "🎁 Пробный"
+    elif sub_type == 'weekly':
+        if user['subscription_expires']:
+            expires = datetime.fromisoformat(user['subscription_expires'])
+            return f"📅 Неделя (до {expires.strftime('%d.%m.%Y')})"
+        return "📅 Неделя"
     elif sub_type == 'monthly':
         if user['subscription_expires']:
             expires = datetime.fromisoformat(user['subscription_expires'])
-            return f"💎 Месячная (до {expires.strftime('%d.%m.%Y')})"
-        return "💎 Месячная"
+            return f"💎 Месяц (до {expires.strftime('%d.%m.%Y')})"
+        return "💎 Месяц"
+    elif sub_type == 'quarterly':
+        if user['subscription_expires']:
+            expires = datetime.fromisoformat(user['subscription_expires'])
+            return f"💼 Квартал (до {expires.strftime('%d.%m.%Y')})"
+        return "💼 Квартал"
     elif sub_type == 'yearly':
         if user['subscription_expires']:
             expires = datetime.fromisoformat(user['subscription_expires'])
-            return f"👑 Годовая (до {expires.strftime('%d.%m.%Y')})"
-        return "👑 Годовая"
+            return f"👑 Год (до {expires.strftime('%d.%m.%Y')})"
+        return "👑 Год"
     elif sub_type == 'lifetime':
         return "♾️ Навсегда"
     else:
@@ -911,7 +1129,9 @@ def format_user_short(user: Dict, index: int) -> str:
     sub_emoji = {
         'free': '🆓',
         'trial': '🎁',
+        'weekly': '📅',
         'monthly': '💎',
+        'quarterly': '💼',
         'yearly': '👑',
         'lifetime': '♾️'
     }.get(user['subscription_type'], '❓')
@@ -940,6 +1160,7 @@ def get_main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     builder.button(text="💎 Подписка", callback_data="subscription")
     builder.button(text="🔗 Подключения", callback_data="connections")
     builder.button(text="⭐ Мои Stars", callback_data="my_stars")
+    builder.button(text="👥 Рефералы", callback_data="referrals")
     builder.button(text="⚙️ Настройки", callback_data="settings")
     builder.button(text="ℹ️ Помощь", callback_data="help")
     
@@ -949,16 +1170,47 @@ def get_main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     builder.adjust(2)
     return builder.as_markup()
 
-def get_subscription_keyboard(trial_used: bool) -> InlineKeyboardMarkup:
+def get_subscription_keyboard(trial_used: bool, has_stars: bool = False) -> InlineKeyboardMarkup:
     """Клавиатура выбора подписки"""
     builder = InlineKeyboardBuilder()
     
-    if not trial_used:
-        builder.button(text="🎁 Пробный (7 дней)", callback_data="sub_trial")
-    
-    builder.button(text="💳 Месяц - 99₽", callback_data="sub_monthly")
-    builder.button(text="💳 Год - 777₽", callback_data="sub_yearly")
+    builder.button(text=f"📅 Неделя - {WEEKLY_PRICE} ⭐", callback_data="sub_weekly")
+    builder.button(text=f"💎 Месяц - {MONTHLY_PRICE} ⭐", callback_data="sub_monthly")
+    builder.button(text=f"💼 Квартал - {QUARTERLY_PRICE} ⭐ (-20%)", callback_data="sub_quarterly")
+    builder.button(text=f"👑 Год - {YEARLY_PRICE} ⭐ (-33%)", callback_data="sub_yearly")
     builder.button(text="◀️ Назад", callback_data="main_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_settings_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура настроек"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔔 Уведомления", callback_data="settings_notifications")
+    builder.button(text="📥 Экспорт данных", callback_data="settings_export")
+    builder.button(text="🗑 Очистка", callback_data="settings_cleanup")
+    builder.button(text="◀️ Назад", callback_data="main_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def get_notifications_settings_keyboard(user: Dict) -> InlineKeyboardMarkup:
+    """Клавиатура настроек уведомлений"""
+    builder = InlineKeyboardBuilder()
+    
+    deletions_status = "✅" if user['notify_deletions'] else "❌"
+    edits_status = "✅" if user['notify_edits'] else "❌"
+    timers_status = "✅" if user['notify_media_timers'] else "❌"
+    connections_status = "✅" if user['notify_connections'] else "❌"
+    
+    builder.button(text=f"{deletions_status} Удаления", 
+                  callback_data="toggle_notify_deletions")
+    builder.button(text=f"{edits_status} Редактирования", 
+                  callback_data="toggle_notify_edits")
+    builder.button(text=f"{timers_status} Медиа с таймерами", 
+                  callback_data="toggle_notify_media_timers")
+    builder.button(text=f"{connections_status} Подключения", 
+                  callback_data="toggle_notify_connections")
+    builder.button(text="◀️ Назад", callback_data="settings")
+    
     builder.adjust(1)
     return builder.as_markup()
 
@@ -977,18 +1229,21 @@ def get_users_list_keyboard(page: int = 0, total_pages: int = 1) -> InlineKeyboa
     """Клавиатура списка пользователей с пагинацией"""
     builder = InlineKeyboardBuilder()
     
-    # Кнопки навигации
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text="◀️ Пред", callback_data=f"users_page_{page-1}"))
-    nav_buttons.append(InlineKeyboardButton(text=f"📄 {page+1}/{total_pages}", callback_data="users_page_info"))
+        nav_buttons.append(InlineKeyboardButton(text="◀️ Пред", 
+                                               callback_data=f"users_page_{page-1}"))
+    nav_buttons.append(InlineKeyboardButton(text=f"📄 {page+1}/{total_pages}", 
+                                           callback_data="users_page_info"))
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton(text="След ▶️", callback_data=f"users_page_{page+1}"))
+        nav_buttons.append(InlineKeyboardButton(text="След ▶️", 
+                                               callback_data=f"users_page_{page+1}"))
     
     for btn in nav_buttons:
         builder.add(btn)
     
-    builder.row(InlineKeyboardButton(text="🔢 Выбрать по номеру", callback_data="select_user_by_number"))
+    builder.row(InlineKeyboardButton(text="🔢 Выбрать по номеру", 
+                                    callback_data="select_user_by_number"))
     builder.row(InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel"))
     
     return builder.as_markup()
@@ -1019,9 +1274,9 @@ def get_gift_subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Клавиатура выбора подарочной подписки"""
     builder = InlineKeyboardBuilder()
     
-    builder.button(text="🎁 7 дней", callback_data=f"gift_sub_{user_id}_trial_7")
+    builder.button(text="📅 7 дней", callback_data=f"gift_sub_{user_id}_trial_7")
     builder.button(text="💎 1 месяц", callback_data=f"gift_sub_{user_id}_monthly_30")
-    builder.button(text="💎 3 месяца", callback_data=f"gift_sub_{user_id}_monthly_90")
+    builder.button(text="💼 3 месяца", callback_data=f"gift_sub_{user_id}_quarterly_90")
     builder.button(text="👑 1 год", callback_data=f"gift_sub_{user_id}_yearly_365")
     builder.button(text="♾️ Навсегда", callback_data=f"gift_sub_{user_id}_lifetime_0")
     builder.button(text="◀️ Назад", callback_data=f"manage_user_{user_id}")
@@ -1049,7 +1304,17 @@ async def cmd_start(message: Message, state: FSMContext):
     first_name = message.from_user.first_name
     last_name = message.from_user.last_name
     
-    db.add_user(user_id, username, first_name, last_name)
+    # Проверяем на реферальный код
+    args = message.text.split()[1:] if len(message.text.split()) > 1 else []
+    referrer_id = None
+    
+    if args and args[0].startswith('ref'):
+        ref_code = args[0]
+        referrer = db.get_user_by_referral_code(ref_code)
+        if referrer and referrer['user_id'] != user_id:
+            referrer_id = referrer['user_id']
+    
+    db.add_user(user_id, username, first_name, last_name, referrer_id)
     user = db.get_user(user_id)
     
     if user['is_blocked']:
@@ -1061,10 +1326,11 @@ async def cmd_start(message: Message, state: FSMContext):
     
     if not user['accepted_terms']:
         await message.answer(
-            "👋 <b>Добро пожаловать в Business Message Monitor!</b>\n\n"
+            "👋 <b>Добро пожаловать в Chat Monitor!</b>\n\n"
             "🔐 Мониторинг удаленных и измененных сообщений\n"
-            "📸 Сохранение медиафайлов с таймерами\n"
-            "⚡ Мгновенные уведомления\n\n"
+            "📸 Сохранение медиа с таймерами самоуничтожения\n"
+            "⚡ Мгновенные уведомления\n"
+            "👥 Реферальная система с бонусами\n\n"
             "Перед использованием необходимо принять условия.",
             reply_markup=get_start_keyboard()
         )
@@ -1085,28 +1351,36 @@ async def show_terms(callback: CallbackQuery):
 📄 <b>УСЛОВИЯ ИСПОЛЬЗОВАНИЯ</b>
 
 <b>1. ОБЩИЕ ПОЛОЖЕНИЯ</b>
-Бот мониторит бизнес-чаты и сохраняет сообщения, включая удаленные и с таймерами.
+Бот мониторит ваши чаты и сохраняет сообщения, включая удаленные и с таймерами самоуничтожения.
 
 <b>2. ФУНКЦИОНАЛ</b>
-• Сохранение удаленных сообщений
+• Сохранение всех сообщений из подключенных чатов
+• Уведомления об удаленных сообщениях
 • Отслеживание изменений
-• Сохранение медиа с таймерами
-• Экспорт чатов
+• Сохранение медиафайлов с таймерами
+• Реферальная система
 
-<b>3. ОГРАНИЧЕНИЯ</b>
-• Только бизнес-подключения
-• Не видит личные чаты
-• Работает после подключения
+<b>3. ПОДКЛЮЧЕНИЕ</b>
+• Настройки → Чат-боты → Добавить
+• Бот работает только с явно подключенными чатами
+• Нет доступа к другим вашим чатам
 
-<b>4. КОНФИДЕНЦИАЛЬНОСТЬ</b>
-• Защищенное хранение
-• Доступ только у владельца
-• Возможность удаления
+<b>4. КОНФИДЕНЦИАЛЬНОСТЬ И ОТВЕТСТВЕННОСТЬ</b>
+• Администрация НЕ несет ответственности за действия пользователей
+• Администрация НЕ несет ответственности за непредвиденные ситуации
+• Администрация ГАРАНТИРУЕТ: личная информация пользователей не передается третьим лицам (кроме госорганов по официальным запросам)
+• Это ЕДИНСТВЕННАЯ гарантия администрации
+• Все остальные риски пользователь берет на себя
 
 <b>5. ПОДПИСКИ</b>
-• Пробный: 7 дней
-• Месячная: 99₽
-• Годовая: 777₽
+• Пробный: 3 дня автоматически
+• Неделя: 20 ⭐
+• Месяц: 50 ⭐
+• Квартал: 120 ⭐ (скидка 20%)
+• Год: 400 ⭐ (скидка 33%)
+
+<b>6. ОПЛАТА</b>
+Оплата производится в Telegram Stars напрямую в боте. Возврат возможен в течение 24 часов.
 
 Нажимая "Принять", вы соглашаетесь с условиями.
     """
@@ -1121,11 +1395,11 @@ async def accept_terms(callback: CallbackQuery):
     await callback.message.edit_text(
         "✅ <b>Условия приняты!</b>\n\n"
         "<b>Подключите бота:</b>\n"
-        "1. Настройки → Telegram Business\n"
-        "2. Чат-боты → Добавить\n"
+        "1. Настройки → Чат-боты\n"
+        "2. Добавить чат-бота\n"
         "3. Введите: @mrztnbot\n"
         "4. Настройте параметры\n\n"
-        "После подключения бот начнет работу!",
+        "После подключения бот автоматически активирует пробный период!",
         reply_markup=get_main_menu_keyboard(user_id)
     )
     
@@ -1171,6 +1445,7 @@ async def show_stats(callback: CallbackQuery):
 
 <b>Статус:</b> {format_subscription_info(user)}
 <b>⭐ Stars:</b> {user['stars_balance']}
+<b>👥 Рефералов:</b> {user['total_referrals']} (заработано {user['referral_earnings']} ⭐)
 
 <b>📱 Подключения:</b> {len(connections)}
 <b>💬 Сообщений:</b> {user['total_messages_saved']}
@@ -1183,7 +1458,8 @@ async def show_stats(callback: CallbackQuery):
 ├ Кружки: {user['total_video_note']}
 ├ Документы: {user['total_document']}
 ├ Аудио: {user['total_audio']}
-└ Голосовые: {user['total_voice']}
+├ Голосовые: {user['total_voice']}
+└ Стикеры: {user['total_sticker']}
 
 <b>📅 Зарегистрирован:</b> {user['registered_at'][:10]}
 <b>🕐 Последняя активность:</b> {user['last_activity'][:16]}
@@ -1207,20 +1483,75 @@ async def show_stars(callback: CallbackQuery):
 <b>Ваш баланс:</b> {balance} ⭐
 
 <b>Что такое Stars?</b>
-Stars - виртуальная валюта бота для поощрений и бонусов.
+Stars - виртуальная валюта Telegram для оплаты подписок и услуг.
 
 <b>Как получить?</b>
-• За активность
+• Купить в Telegram (@PremiumBot)
+• Пригласить друзей (20% от их оплат)
 • Подарок от админа
-• Специальные акции
 
-<b>Что можно:</b>
-• Обменять на подписку
-• Получить бонусы
-• Участвовать в конкурсах
+<b>Как использовать?</b>
+• Оплатить подписку бота
+• Получить реферальные бонусы
 
-<i>Следите за обновлениями!</i>
+<b>Цены подписок:</b>
+📅 Неделя - {WEEKLY_PRICE} ⭐
+💎 Месяц - {MONTHLY_PRICE} ⭐
+💼 Квартал - {QUARTERLY_PRICE} ⭐ (скидка 20%)
+👑 Год - {YEARLY_PRICE} ⭐ (скидка 33%)
     """
+    
+    await callback.message.edit_text(text, reply_markup=get_back_keyboard())
+
+@router.callback_query(F.data == "referrals")
+async def show_referrals(callback: CallbackQuery):
+    """Показ реферальной системы"""
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    ref_stats = db.get_referral_stats(user_id)
+    
+    ref_link = f"https://t.me/{callback.bot.username}?start={user['referral_code']}"
+    
+    text = f"""
+👥 <b>Реферальная программа</b>
+
+<b>Ваша реферальная ссылка:</b>
+<code>{ref_link}</code>
+
+<b>Статистика:</b>
+• Приглашено: {ref_stats['total']} чел.
+• Заработано: {ref_stats['earnings']} ⭐
+
+<b>Как это работает?</b>
+1. Делитесь ссылкой с друзьями
+2. Они регистрируются по вашей ссылке
+3. При их оплате вы получаете {REFERRAL_BONUS_PERCENT}% в Stars
+
+<b>Пример:</b>
+Друг купил подписку за 50 ⭐
+Вы получили: {int(50 * REFERRAL_BONUS_PERCENT / 100)} ⭐
+
+<b>Ваши рефералы:</b>
+"""
+    
+    if ref_stats['referrals']:
+        for i, ref in enumerate(ref_stats['referrals'][:5], 1):
+            sub_emoji = {
+                'free': '🆓',
+                'trial': '🎁',
+                'weekly': '📅',
+                'monthly': '💎',
+                'quarterly': '💼',
+                'yearly': '👑',
+                'lifetime': '♾️'
+            }.get(ref['subscription_type'], '❓')
+            
+            name = ref['first_name'] or "Пользователь"
+            text += f"{i}. {sub_emoji} {name}\n"
+    else:
+        text += "Пока никого\n"
+    
+    text += "\n💡 Пригласите друзей и зарабатывайте Stars!"
     
     await callback.message.edit_text(text, reply_markup=get_back_keyboard())
 
@@ -1229,6 +1560,7 @@ async def show_subscription(callback: CallbackQuery):
     """Управление подпиской"""
     user_id = callback.from_user.id
     user = db.get_user(user_id)
+    balance = db.get_stars_balance(user_id)
     
     text = f"""
 💎 <b>Управление подпиской</b>
@@ -1236,85 +1568,131 @@ async def show_subscription(callback: CallbackQuery):
 <b>Текущий статус:</b>
 {format_subscription_info(user)}
 
+<b>Ваш баланс:</b> {balance} ⭐
+
 <b>Доступные планы:</b>
-"""
-    
-    if not user['trial_used']:
-        text += "\n🎁 <b>Пробный</b> - 7 дней бесплатно"
-    
-    text += """
 
-💳 <b>Месячная</b> - 99₽
-├ Все функции
-├ Неограниченное хранилище
-└ Приоритетная поддержка
+📅 <b>Неделя</b> - {WEEKLY_PRICE} ⭐
+Попробуйте на 7 дней
 
-💳 <b>Годовая</b> - 777₽
-├ Все функции месячной
-├ Экономия 411₽ (52%)
-└ Специальные бонусы
+💎 <b>Месяц</b> - {MONTHLY_PRICE} ⭐
+Оптимальный выбор
+
+💼 <b>Квартал</b> - {QUARTERLY_PRICE} ⭐
+Экономия {int((MONTHLY_PRICE * 3 - QUARTERLY_PRICE) / (MONTHLY_PRICE * 3) * 100)}%
+
+👑 <b>Год</b> - {YEARLY_PRICE} ⭐
+Максимальная экономия {int((MONTHLY_PRICE * 12 - YEARLY_PRICE) / (MONTHLY_PRICE * 12) * 100)}%
+
+<b>Что входит:</b>
+✅ Все функции бота
+✅ Неограниченное хранилище
+✅ Приоритетная поддержка
+✅ Реферальные бонусы
 
 Выберите подходящий план:
     """
     
     await callback.message.edit_text(
         text,
-        reply_markup=get_subscription_keyboard(user['trial_used'])
+        reply_markup=get_subscription_keyboard(user['trial_used'], balance > 0)
     )
 
-@router.callback_query(F.data == "sub_trial")
-async def activate_trial_handler(callback: CallbackQuery):
-    """Активация пробного периода"""
+@router.callback_query(F.data.startswith("sub_"))
+async def process_subscription_payment(callback: CallbackQuery):
+    """Обработка выбора подписки и создание инвойса"""
     user_id = callback.from_user.id
-    user = db.get_user(user_id)
+    plan = callback.data.split("_")[1]
     
-    if user['trial_used']:
-        await callback.answer("❌ Вы уже использовали пробный период", show_alert=True)
+    prices_map = {
+        "weekly": (WEEKLY_PRICE, "Недельная подписка"),
+        "monthly": (MONTHLY_PRICE, "Месячная подписка"),
+        "quarterly": (QUARTERLY_PRICE, "Квартальная подписка"),
+        "yearly": (YEARLY_PRICE, "Годовая подписка")
+    }
+    
+    if plan not in prices_map:
+        await callback.answer("❌ Неверный план")
         return
     
-    db.activate_trial(user_id)
-    db.add_stars(user_id, 10, "Бонус за активацию пробного периода")
+    amount, title = prices_map[plan]
     
-    await callback.message.edit_text(
-        "🎉 <b>Пробный период активирован!</b>\n\n"
-        "✅ 7 дней полного доступа\n"
-        "🎁 +10 Stars в подарок\n\n"
-        "Наслаждайтесь! 🚀",
-        reply_markup=get_back_keyboard()
+    # Создаем инвойс для оплаты в Stars
+    try:
+        await callback.bot.send_invoice(
+            chat_id=user_id,
+            title=title,
+            description=f"Оплата подписки на {plan.replace('_', ' ')}",
+            payload=f"subscription_{plan}_{user_id}",
+            provider_token="",  # Для XTR оставляем пустым
+            currency="XTR",
+            prices=[LabeledPrice(label="XTR", amount=amount)],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Оплатить ⭐", pay=True)]
+            ])
+        )
+        await callback.answer("✅ Инвойс создан!")
+    except Exception as e:
+        logger.error(f"Ошибка создания инвойса: {e}")
+        await callback.answer("❌ Ошибка создания платежа", show_alert=True)
+
+@router.pre_checkout_query()
+async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
+    """Обработка pre-checkout запроса"""
+    await pre_checkout_query.bot.answer_pre_checkout_query(
+        pre_checkout_query.id, 
+        ok=True
+    )
+
+@router.message(F.successful_payment)
+async def process_successful_payment(message: Message):
+    """Обработка успешного платежа"""
+    user_id = message.from_user.id
+    payment = message.successful_payment
+    
+    # Парсим payload
+    payload_parts = payment.invoice_payload.split("_")
+    if len(payload_parts) < 2:
+        logger.error(f"Неверный payload: {payment.invoice_payload}")
+        return
+    
+    plan_type = payload_parts[1]
+    amount_stars = payment.total_amount
+    
+    # Сохраняем платеж
+    db.save_payment(
+        user_id=user_id,
+        amount_stars=amount_stars,
+        plan_type=plan_type,
+        payment_charge_id=payment.provider_payment_charge_id,
+        telegram_payment_charge_id=payment.telegram_payment_charge_id
     )
     
+    # Активируем подписку
+    db.activate_subscription(user_id, plan_type)
+    
+    # Обрабатываем реферальный бонус
+    db.process_referral_payment(user_id, amount_stars)
+    
+    user = db.get_user(user_id)
+    
+    await message.answer(
+        f"🎉 <b>Оплата успешна!</b>\n\n"
+        f"Подписка активирована: {format_subscription_info(user)}\n\n"
+        f"Спасибо за использование бота!"
+    )
+    
+    # Уведомляем админа
     try:
-        await callback.bot.send_message(
+        await message.bot.send_message(
             ADMIN_ID,
-            f"🎁 Активирован пробный период:\n"
-            f"ID: {user_id}\n"
-            f"@{callback.from_user.username or 'нет'}"
+            f"💰 Новый платеж!\n"
+            f"User: {user_id}\n"
+            f"Plan: {plan_type}\n"
+            f"Amount: {amount_stars} ⭐"
         )
     except:
         pass
-
-@router.callback_query(F.data.startswith("sub_"))
-async def process_subscription(callback: CallbackQuery):
-    """Обработка выбора подписки"""
-    plan = callback.data.split("_")[1]
-    
-    if plan == "trial":
-        return
-    
-    prices = {
-        "monthly": "99₽",
-        "yearly": "777₽"
-    }
-    
-    await callback.message.edit_text(
-        f"💳 <b>Оплата подписки</b>\n\n"
-        f"План: {'Месячная' if plan == 'monthly' else 'Годовая'}\n"
-        f"Стоимость: {prices.get(plan)}\n\n"
-        f"<b>Для оплаты свяжитесь с администратором:</b>\n"
-        f"@{ADMIN_USERNAME}\n\n"
-        f"После оплаты подписка будет активирована.",
-        reply_markup=get_back_keyboard()
-    )
 
 @router.callback_query(F.data == "connections")
 async def show_connections(callback: CallbackQuery):
@@ -1329,8 +1707,8 @@ async def show_connections(callback: CallbackQuery):
 У вас нет активных подключений.
 
 <b>Как подключить бота:</b>
-1. Настройки → Telegram Business
-2. Чат-боты → Добавить
+1. Настройки → Чат-боты
+2. Добавить чат-бота
 3. @mrztnbot
 4. Настройте параметры
 
@@ -1351,13 +1729,57 @@ async def show_settings(callback: CallbackQuery):
     """Показ настроек"""
     await callback.message.edit_text(
         "⚙️ <b>Настройки</b>\n\n"
-        "Доступные настройки:\n\n"
-        "🔔 Уведомления - скоро\n"
-        "📥 Экспорт - скоро\n"
-        "🗑 Очистка - скоро\n"
-        "🔐 Приватность - скоро",
-        reply_markup=get_back_keyboard()
+        "Выберите раздел:",
+        reply_markup=get_settings_keyboard()
     )
+
+@router.callback_query(F.data == "settings_notifications")
+async def settings_notifications(callback: CallbackQuery):
+    """Настройки уведомлений"""
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    
+    text = """
+🔔 <b>Настройки уведомлений</b>
+
+Настройте, какие события будут присылать вам уведомления:
+
+✅ - уведомления включены
+❌ - уведомления отключены
+    """
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=get_notifications_settings_keyboard(user)
+    )
+
+@router.callback_query(F.data.startswith("toggle_notify_"))
+async def toggle_notification(callback: CallbackQuery):
+    """Переключение настройки уведомления"""
+    user_id = callback.from_user.id
+    setting = callback.data.replace("toggle_", "")
+    
+    user = db.get_user(user_id)
+    current_value = user[setting]
+    new_value = not current_value
+    
+    db.update_notification_settings(user_id, setting, new_value)
+    
+    user = db.get_user(user_id)
+    await callback.message.edit_reply_markup(
+        reply_markup=get_notifications_settings_keyboard(user)
+    )
+    await callback.answer(f"{'✅ Включено' if new_value else '❌ Отключено'}")
+
+@router.callback_query(F.data == "settings_export")
+async def settings_export(callback: CallbackQuery):
+    """Экспорт данных"""
+    await callback.answer("Функция в разработке", show_alert=True)
+
+@router.callback_query(F.data == "settings_cleanup")
+async def settings_cleanup(callback: CallbackQuery):
+    """Очистка данных"""
+    await callback.answer("Функция в разработке", show_alert=True)
 
 @router.callback_query(F.data == "help")
 async def show_help(callback: CallbackQuery):
@@ -1366,7 +1788,7 @@ async def show_help(callback: CallbackQuery):
 ℹ️ <b>Справка</b>
 
 <b>Как работает:</b>
-Бот мониторит бизнес-чаты через Telegram Business API и сохраняет все сообщения, включая удаленные и с таймерами.
+Бот мониторит ваши чаты и сохраняет все сообщения, включая удаленные и с таймерами.
 
 <b>Основные функции:</b>
 • 📝 Сохранение всех сообщений
@@ -1375,6 +1797,14 @@ async def show_help(callback: CallbackQuery):
 • 📸 Сохранение медиа с таймерами
 • ⏱ Кружки с таймерами
 • 📦 Экспорт чатов
+• 👥 Реферальная система
+
+<b>Подписка:</b>
+Первые 3 дня бесплатно автоматически!
+Далее от 20 ⭐ в неделю
+
+<b>Рефералы:</b>
+Приглашайте друзей и получайте 20% от их оплат
 
 <b>Команды:</b>
 /start - Главное меню
@@ -1382,10 +1812,6 @@ async def show_help(callback: CallbackQuery):
 
 <b>Поддержка:</b>
 @""" + ADMIN_USERNAME + """
-
-<b>Stars:</b>
-⭐ - виртуальная валюта бота
-Получайте за активность!
     """
     
     await callback.message.edit_text(help_text, reply_markup=get_back_keyboard())
@@ -1420,7 +1846,6 @@ async def admin_users(callback: CallbackQuery):
         await callback.answer("❌ Доступ запрещен", show_alert=True)
         return
     
-    # Получаем номер страницы
     if callback.data.startswith("users_page_"):
         try:
             page = int(callback.data.split("_")[-1])
@@ -1490,7 +1915,6 @@ async def process_user_number(message: Message, state: FSMContext):
             )
             return
         
-        # Получаем пользователя по номеру (индекс = номер - 1)
         users = db.get_all_users(limit=1, offset=number-1)
         if not users:
             await message.answer("❌ Пользователь не найден")
@@ -1519,6 +1943,7 @@ async def show_user_details(message: Message, user_id: int):
 <b>Username:</b> @{user['username'] or 'нет'}
 <b>Статус:</b> {format_subscription_info(user)}
 <b>⭐ Stars:</b> {user['stars_balance']}
+<b>👥 Рефералов:</b> {user['total_referrals']} (заработано {user['referral_earnings']} ⭐)
 
 <b>Статистика:</b>
 📱 Подключений: {len(connections)}
@@ -1558,6 +1983,7 @@ async def manage_user_callback(callback: CallbackQuery):
 <b>Username:</b> @{user['username'] or 'нет'}
 <b>Статус:</b> {format_subscription_info(user)}
 <b>⭐ Stars:</b> {user['stars_balance']}
+<b>👥 Рефералов:</b> {user['total_referrals']} (заработано {user['referral_earnings']} ⭐)
 
 <b>Статистика:</b>
 📱 Подключений: {len(connections)}
@@ -1645,10 +2071,10 @@ async def process_gift_subscription(callback: CallbackQuery):
     
     db.activate_subscription(user_id, plan_type, days)
     
-    # Отправляем бонусные Stars
     bonus_stars = {
         'trial': 5,
         'monthly': 10,
+        'quarterly': 25,
         'yearly': 50,
         'lifetime': 100
     }.get(plan_type, 0)
@@ -1659,6 +2085,7 @@ async def process_gift_subscription(callback: CallbackQuery):
     plan_names = {
         'trial': 'Пробный период (7 дней)',
         'monthly': 'Месячная подписка',
+        'quarterly': 'Квартальная подписка',
         'yearly': 'Годовая подписка',
         'lifetime': 'Вечная подписка'
     }
@@ -1671,7 +2098,6 @@ async def process_gift_subscription(callback: CallbackQuery):
         reply_markup=get_user_management_keyboard(user_id)
     )
     
-    # Уведомляем пользователя
     try:
         await callback.bot.send_message(
             user_id,
@@ -1723,7 +2149,6 @@ async def process_admin_stars(message: Message, state: FSMContext):
         
         await message.answer(f"✅ Отправлено {amount} ⭐ пользователю {target_user_id}")
         
-        # Уведомляем пользователя
         try:
             await message.bot.send_message(
                 target_user_id,
@@ -1753,7 +2178,6 @@ async def admin_block_user(callback: CallbackQuery):
     await callback.answer("✅ Пользователь заблокирован", show_alert=True)
     await callback.message.edit_reply_markup(reply_markup=get_user_management_keyboard(user_id))
     
-    # Уведомляем пользователя
     try:
         await callback.bot.send_message(
             user_id,
@@ -1776,7 +2200,6 @@ async def admin_unblock_user(callback: CallbackQuery):
     await callback.answer("✅ Пользователь разблокирован", show_alert=True)
     await callback.message.edit_reply_markup(reply_markup=get_user_management_keyboard(user_id))
     
-    # Уведомляем пользователя
     try:
         await callback.bot.send_message(
             user_id,
@@ -1847,11 +2270,12 @@ async def admin_stats(callback: CallbackQuery):
             'video_note': '⭕',
             'document': '📄',
             'audio': '🎵',
-            'voice': '🎤'
+            'voice': '🎤',
+            'sticker': '🎨'
         }.get(media_type, '📎')
         text += f"{emoji} {media_type}: {count}\n"
     
-    text += f"\n<b>🤖 Система:</b>\nВерсия: 5.0.0\nСтатус: Работает ✅"
+    text += f"\n<b>🤖 Система:</b>\nВерсия: 6.0.0\nСтатус: Работает ✅"
     
     await callback.message.edit_text(text, reply_markup=get_back_keyboard())
 
@@ -1960,7 +2384,7 @@ async def process_search(message: Message, state: FSMContext):
 
 @router.business_connection()
 async def on_business_connection(business_connection: BusinessConnection, bot: Bot):
-    """Обработка подключения бизнес-аккаунта"""
+    """Обработка подключения"""
     try:
         user_id = business_connection.user.id
         connection_id = business_connection.id
@@ -1973,21 +2397,36 @@ async def on_business_connection(business_connection: BusinessConnection, bot: B
             can_reply=can_reply
         )
         
-        logger.info(f"Бизнес-подключение: {connection_id} для {user_id}")
+        # Автоматически активируем пробный период при первом подключении
+        user = db.get_user(user_id)
+        if user and not user['auto_trial_activated']:
+            trial_activated = db.activate_auto_trial(user_id)
+            if trial_activated:
+                logger.info(f"Автоматический пробный период активирован для {user_id}")
         
-        try:
-            await bot.send_message(
-                user_id,
-                f"🎉 <b>Бот подключен!</b>\n\n"
-                f"Теперь я отслеживаю ваши бизнес-чаты.\n\n"
-                f"✅ Сохранение сообщений\n"
-                f"✅ Отслеживание удалений\n"
-                f"✅ Сохранение медиа с таймерами\n"
-                f"✅ Мгновенные уведомления\n\n"
-                f"ID: <code>{connection_id[:16]}...</code>"
-            )
-        except Exception as e:
-            logger.error(f"Ошибка уведомления о подключении: {e}")
+        logger.info(f"Подключение: {connection_id} для {user_id}")
+        
+        user = db.get_user(user_id)
+        
+        # Проверяем настройки уведомлений
+        if user and user['notify_connections']:
+            try:
+                trial_msg = ""
+                if user['auto_trial_activated'] and user['subscription_type'] == 'trial':
+                    trial_msg = f"\n\n🎁 <b>Пробный период активирован!</b>\nДоступ ко всем функциям на {TRIAL_DAYS} дня"
+                
+                await bot.send_message(
+                    user_id,
+                    f"🎉 <b>Бот подключен!</b>\n\n"
+                    f"Теперь я отслеживаю ваши чаты.\n\n"
+                    f"✅ Сохранение сообщений\n"
+                    f"✅ Отслеживание удалений\n"
+                    f"✅ Сохранение медиа с таймерами\n"
+                    f"✅ Мгновенные уведомления{trial_msg}\n\n"
+                    f"ID: <code>{connection_id[:16]}...</code>"
+                )
+            except Exception as e:
+                logger.error(f"Ошибка уведомления о подключении: {e}")
         
         try:
             await bot.send_message(
@@ -2004,7 +2443,7 @@ async def on_business_connection(business_connection: BusinessConnection, bot: B
 
 @router.business_message()
 async def on_business_message(message: Message, bot: Bot):
-    """Обработка входящих бизнес-сообщений с поддержкой таймеров"""
+    """Обработка входящих сообщений с поддержкой таймеров"""
     try:
         if not message.business_connection_id:
             return
@@ -2020,7 +2459,6 @@ async def on_business_message(message: Message, bot: Bot):
             logger.info(f"Нет активной подписки: {user_id}")
             return
         
-        # Определяем параметры медиа
         media_type = None
         media_file_id = None
         media_file_path = None
@@ -2034,22 +2472,22 @@ async def on_business_message(message: Message, bot: Bot):
         media_file_size = None
         caption = message.caption
         
-        # Фото (включая с таймером)
+        # Проверяем медиа с таймерами
+        if hasattr(message, 'has_media_spoiler') and message.has_media_spoiler:
+            has_timer = True
+            is_view_once = True
+        
+        # Фото
         if message.photo:
             media_type = "photo"
-            photo = message.photo[-1]  # Самое большое фото
+            photo = message.photo[-1]
             media_file_id = photo.file_id
             media_width = photo.width
             media_height = photo.height
             media_file_size = photo.file_size
-            
-            # Проверяем на таймер самоуничтожения
-            if hasattr(message, 'has_media_spoiler') and message.has_media_spoiler:
-                is_view_once = True
-            
             media_file_path = await download_media(bot, media_file_id, media_type, user_id, has_timer)
         
-        # Видео (включая с таймером)
+        # Видео
         elif message.video:
             media_type = "video"
             video = message.video
@@ -2058,28 +2496,20 @@ async def on_business_message(message: Message, bot: Bot):
             media_height = video.height
             media_duration = video.duration
             media_file_size = video.file_size
-            
-            if hasattr(message, 'has_media_spoiler') and message.has_media_spoiler:
-                is_view_once = True
-            
             media_file_path = await download_media(bot, media_file_id, media_type, user_id, has_timer)
             
-            # Миниатюра
             if video.thumbnail:
                 media_thumbnail_path = await download_thumbnail(bot, video.thumbnail, user_id)
         
-        # Кружки (video_note) - поддержка таймеров
+        # Кружки
         elif message.video_note:
             media_type = "video_note"
             video_note = message.video_note
             media_file_id = video_note.file_id
             media_duration = video_note.duration
             media_file_size = video_note.file_size
-            
-            # Кружки часто имеют таймеры
             has_timer = True
             timer_seconds = video_note.duration if video_note.duration else 60
-            
             media_file_path = await download_media(bot, media_file_id, media_type, user_id, has_timer)
             
             if video_note.thumbnail:
@@ -2106,11 +2536,11 @@ async def on_business_message(message: Message, bot: Bot):
             media_file_id = message.voice.file_id
             media_duration = message.voice.duration
             media_file_size = message.voice.file_size
-            has_timer = True  # Голосовые часто с таймером
+            has_timer = True
             timer_seconds = message.voice.duration
             media_file_path = await download_media(bot, media_file_id, media_type, user_id, has_timer)
         
-        # Стикеры (не сохраняем файл, только ID)
+        # Стикеры
         elif message.sticker:
             media_type = "sticker"
             media_file_id = message.sticker.file_id
@@ -2123,6 +2553,7 @@ async def on_business_message(message: Message, bot: Bot):
             message_id=message.message_id,
             sender_id=message.from_user.id,
             sender_username=message.from_user.username,
+            sender_first_name=message.from_user.first_name,
             message_text=message.text or message.caption,
             media_type=media_type,
             media_file_id=media_file_id,
@@ -2140,12 +2571,26 @@ async def on_business_message(message: Message, bot: Bot):
         
         logger.info(f"Сохранено сообщение {message.message_id} (тип: {media_type}, таймер: {has_timer})")
         
+        # Уведомляем о медиа с таймером
+        user = db.get_user(user_id)
+        if user and user['notify_media_timers'] and (has_timer or is_view_once):
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"⏱ <b>Сохранено медиа с таймером!</b>\n\n"
+                    f"Тип: {media_type}\n"
+                    f"{'Одноразовый просмотр' if is_view_once else f'Таймер: {timer_seconds}с'}\n"
+                    f"От: {message.from_user.first_name or 'Пользователь'}"
+                )
+            except:
+                pass
+        
     except Exception as e:
-        logger.error(f"Ошибка обработки бизнес-сообщения: {e}", exc_info=True)
+        logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
 
 @router.edited_business_message()
 async def on_edited_business_message(message: Message, bot: Bot):
-    """Обработка отредактированных бизнес-сообщений"""
+    """Обработка отредактированных сообщений"""
     try:
         if not message.business_connection_id:
             return
@@ -2155,6 +2600,10 @@ async def on_edited_business_message(message: Message, bot: Bot):
             return
         
         user_id = connection['user_id']
+        user = db.get_user(user_id)
+        
+        if not user or not user['notify_edits']:
+            return
         
         original = db.get_message(user_id, message.chat.id, message.message_id)
         if not original:
@@ -2166,17 +2615,21 @@ async def on_edited_business_message(message: Message, bot: Bot):
         
         db.mark_message_edited(user_id, message.chat.id, message.message_id, original_text)
         
-        sender_name = message.from_user.username or f"User {message.from_user.id}"
+        sender_name = message.from_user.first_name or f"User {message.from_user.id}"
         
+        # Форматируем в цитату
         notification = f"✏️ <b>Сообщение изменено</b>\n\n"
-        notification += f"От: @{sender_name}\n"
+        notification += f"От: {sender_name}\n"
         notification += f"Чат: {message.chat.title or message.chat.first_name or 'ЛС'}\n"
         notification += f"Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
-        notification += f"<b>Было:</b>\n{original_text[:200]}\n\n"
-        notification += f"<b>Стало:</b>\n{new_text[:200]}"
+        
+        if original_text:
+            notification += f"<blockquote>Было:\n{original_text[:200]}</blockquote>\n\n"
+        if new_text:
+            notification += f"<blockquote>Стало:\n{new_text[:200]}</blockquote>"
         
         try:
-            await bot.send_message(user_id, notification[:4000])
+            await bot.send_message(user_id, notification[:4000], parse_mode=ParseMode.HTML)
         except Exception as e:
             logger.error(f"Ошибка уведомления об изменении: {e}")
         
@@ -2187,7 +2640,7 @@ async def on_edited_business_message(message: Message, bot: Bot):
 
 @router.deleted_business_messages()
 async def on_deleted_business_messages(deleted: BusinessMessagesDeleted, bot: Bot):
-    """Обработка удаленных бизнес-сообщений"""
+    """Обработка удаленных сообщений"""
     try:
         connection_id = deleted.business_connection_id
         chat = deleted.chat
@@ -2201,22 +2654,60 @@ async def on_deleted_business_messages(deleted: BusinessMessagesDeleted, bot: Bo
             return
         
         user_id = connection['user_id']
+        user = db.get_user(user_id)
         
+        if not user or not user['notify_deletions']:
+            # Все равно отмечаем как удаленные
+            for message_id in message_ids:
+                db.mark_message_deleted(user_id, chat.id, message_id)
+            return
+        
+        # Если удалено больше 5 сообщений, экспортируем в архив
+        if len(message_ids) > 5:
+            messages = []
+            for message_id in message_ids:
+                saved_msg = db.get_message(user_id, chat.id, message_id)
+                if saved_msg:
+                    db.mark_message_deleted(user_id, chat.id, message_id)
+                    messages.append(saved_msg)
+            
+            if messages:
+                chat_title = chat.title or chat.first_name or f"Chat {chat.id}"
+                archive_path = await export_deleted_chat_to_archive(
+                    user_id, chat.id, messages, chat_title
+                )
+                
+                if archive_path:
+                    try:
+                        await bot.send_document(
+                            user_id,
+                            FSInputFile(archive_path),
+                            caption=f"🗑 <b>Удален чат</b>\n\n"
+                                   f"Чат: {chat_title}\n"
+                                   f"Сообщений: {len(messages)}\n\n"
+                                   f"Все сообщения и медиафайлы сохранены в архиве"
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки архива: {e}")
+            return
+        
+        # Если удалено мало сообщений, отправляем по отдельности
         for message_id in message_ids:
             saved_msg = db.get_message(user_id, chat.id, message_id)
             
             if saved_msg:
                 db.mark_message_deleted(user_id, chat.id, message_id)
                 
-                sender_name = saved_msg['sender_username'] or f"User {saved_msg['sender_id']}"
+                sender_name = saved_msg['sender_first_name'] or f"User {saved_msg['sender_id']}"
                 
+                # Форматируем в цитату
                 notification = f"🗑 <b>Сообщение удалено</b>\n\n"
-                notification += f"От: @{sender_name}\n"
+                notification += f"От: {sender_name}\n"
                 notification += f"Чат: {chat.title or chat.first_name or 'ЛС'}\n"
                 notification += f"Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
                 
                 if saved_msg['message_text']:
-                    notification += f"<b>Текст:</b>\n{saved_msg['message_text'][:300]}\n\n"
+                    notification += f"<blockquote>{saved_msg['message_text'][:300]}</blockquote>\n\n"
                 
                 if saved_msg['media_type']:
                     notification += f"<b>Медиа:</b> {saved_msg['media_type'].upper()}"
@@ -2227,10 +2718,10 @@ async def on_deleted_business_messages(deleted: BusinessMessagesDeleted, bot: Bo
                     notification += "\n"
                     
                     if saved_msg['caption']:
-                        notification += f"<b>Подпись:</b> {saved_msg['caption'][:100]}\n"
+                        notification += f"<blockquote>Подпись: {saved_msg['caption'][:100]}</blockquote>\n"
                 
                 try:
-                    await bot.send_message(user_id, notification[:4000])
+                    await bot.send_message(user_id, notification[:4000], parse_mode=ParseMode.HTML)
                     
                     # Отправляем сохраненное медиа
                     if saved_msg['media_file_path'] and Path(saved_msg['media_file_path']).exists():
@@ -2282,8 +2773,9 @@ async def main():
         
         bot_info = await bot.get_me()
         logger.info(f"🚀 Бот запущен: @{bot_info.username} (ID: {bot_info.id})")
-        logger.info(f"📦 Версия: 5.0.0")
+        logger.info(f"📦 Версия: 6.0.0")
         logger.info(f"👨‍💼 Админ: {ADMIN_ID} (@{ADMIN_USERNAME})")
+        logger.info(f"💎 Автор: Merzost?")
         
         try:
             await bot.send_message(
@@ -2291,14 +2783,18 @@ async def main():
                 "🚀 <b>Бот запущен!</b>\n\n"
                 f"Username: @{bot_info.username}\n"
                 f"ID: {bot_info.id}\n"
-                f"Версия: 5.0.0\n\n"
+                f"Версия: 6.0.0\n"
+                f"Автор: Merzost?\n\n"
                 f"✨ Новое в этой версии:\n"
-                f"• Управление пользователями по номеру\n"
-                f"• Отправка сообщений и Stars\n"
-                f"• Подарок подписок\n"
-                f"• Сохранение медиа с таймерами\n"
-                f"• Поддержка кружков\n"
-                f"• 20+ новых функций"
+                f"• Оплата через Telegram Stars\n"
+                f"• Реферальная система (20% бонус)\n"
+                f"• Настройки уведомлений\n"
+                f"• Автопробный период {TRIAL_DAYS} дня\n"
+                f"• Улучшенное форматирование (цитаты)\n"
+                f"• Экспорт удаленных чатов в архив\n"
+                f"• Полная поддержка таймеров\n"
+                f"• Обновленная политика\n"
+                f"• 30+ улучшений"
             )
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление о запуске: {e}")
